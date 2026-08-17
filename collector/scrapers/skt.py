@@ -1,18 +1,26 @@
 """SKT (T로밍) 스크래퍼.
 
 대상:
-  - T로밍 포털 랜딩(https://troaming.tworld.co.kr/)과 그 하위 정적 상품 페이지(/poc/roaming/*.html)
   - T월드 모바일 로밍 요금 페이지(https://m.tworld.co.kr/product/roaming/fee)
-  - SKT 공지사항(https://www.sktelecom.com/kor/notice/list.do) — '로밍' 키워드 필터
+  - T로밍 전용 공지사항(https://www.tworld.co.kr/web/support/notice/roaming)
 
-포털이 정적 HTML 하위페이지 구조이므로 requests+BS4 로 수집 가능하다.
-셀렉터는 1차 구현이며 scrape_runs 오류 로그를 보고 조정한다.
+검증된 사실(2026-08-18):
+  - 공지사항은 www.sktelecom.com 의 범용 게시판이 아니라 T로밍 전용 게시판이 따로 있다.
+    페이지 자체는 CSR(BFF)이지만 실제 데이터는 공개 REST 엔드포인트
+    (www.tworld.co.kr/core-modification/v1/notice-roaming)에서 내려오며, Referer 헤더만
+    페이지 URL로 채워주면 인증 없이 200을 반환한다(수만 건 규모 게시판, 로밍 키워드 필터 불필요 —
+    게시판 자체가 로밍 전용). 상세 URL 패턴: /web/support/notice/roaming/detail/{serNum}.
+  - baro 요금제는 3/8/16/32/64GB, baro YT 는 4/9/17/33/65GB 로 총 10개 용량 티어가 존재하는데
+    전부 동일한 prodId(NA00007668, T로밍 랜딩 상세페이지 하나에서 용량을 선택하는 구조)를 공유한다.
+    과거 코드는 이 prodId로 만든 URL만으로 dedup 해서 9개 티어가 사라지는 버그가 있었다 —
+    URL+이름 조합으로 dedup 해야 한다(DB 유니크 키 (carrier,category,url,name)와 동일한 기준).
 """
 from __future__ import annotations
 
 import json
 import re
 from datetime import datetime
+from html import unescape as html_unescape
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -24,13 +32,15 @@ from collector.scrapers.base import BaseCarrierScraper, ScrapedItem, ScrapedNoti
 KST = ZoneInfo("Asia/Seoul")
 
 M_FEE_PAGE = "https://m.tworld.co.kr/product/roaming/fee"
-# 구 경로 /kor/notice/list.do 는 소프트 404 반환(2026-08-17 확인) — 실제 게시판은 아래 경로
-NOTICE_LIST = "https://www.sktelecom.com/customer/notice.do"
-NOTICE_PAGES = 3          # 수집할 페이지 수
-NOTICE_KEYWORDS = ("로밍", "eSIM", "해외", "국제")
+
+NOTICE_PAGE_URL = "https://www.tworld.co.kr/web/support/notice/roaming"
+NOTICE_API = "https://www.tworld.co.kr/core-modification/v1/notice-roaming"
+NOTICE_DETAIL = "https://www.tworld.co.kr/web/support/notice/roaming/detail/{sernum}"
+NOTICE_PAGES = 5          # 페이지당 10건 — 최근 50건 수집
 
 PRICE_PATTERN = re.compile(r"[\d,]+\s*원")
 DATA_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(GB|MB|무제한)", re.I)
+HTML_TAG = re.compile(r"<[^>]+>")
 
 
 def _abs(base: str, href: str | None) -> str | None:
@@ -92,54 +102,59 @@ def collect_fee_page_products() -> list[ScrapedItem]:
                 "basFeeInfo": obj.get("basFeeInfo"),
             },
         ))
-    # 페이지에 동일 JSON이 2회 임베드되므로 prodId(URL) 기준 중복 제거
-    unique: dict[str, ScrapedItem] = {}
+    # 페이지에 동일 JSON이 2회 임베드되고, baro 전체 티어가 prodId를 공유하므로
+    # URL+이름 조합으로 중복 제거 (URL만 쓰면 baro 9개 티어가 사라짐)
+    unique: dict[tuple[str, str], ScrapedItem] = {}
     for item in items:
-        unique.setdefault(item.url, item)
+        unique.setdefault((item.url, item.name), item)
     return list(unique.values())
 
 
 def collect_notices() -> list[ScrapedNotice]:
-    """SKT 공지사항 게시판 (/customer/notice.do, SSR 확인됨 2026-08-17).
+    """T로밍 전용 공지사항 (2026-08-18 검증).
 
-    구조: a[href*='notice_detail.do'] 링크 텍스트 = '제목 YYYY.MM.DD' 형태.
-    로밍 관련 키워드가 제목에 포함된 게시글만 채택 (NOTICE_PAGES 페이지 순회).
+    페이지(/web/support/notice/roaming) 자체는 BFF 기반 CSR 이지만, 실제 목록은
+    공개 REST 엔드포인트에서 내려온다. Referer 헤더만 채워주면 인증/쿠키 없이 200.
+    이 게시판은 T로밍 전용이라 전체가 로밍 관련 — 키워드 필터가 필요 없다.
     """
     notices: list[ScrapedNotice] = []
-    for page in range(1, NOTICE_PAGES + 1):
+    headers = {"Accept": "application/json", "Referer": NOTICE_PAGE_URL}
+    for page in range(NOTICE_PAGES):
         try:
-            resp = http.fetch(NOTICE_LIST, params={"currentPage": page})
+            resp = http.fetch(
+                NOTICE_API,
+                params={"size": 10, "expsChnlCd": "O", "page": page, "srchKey": ""},
+                headers=headers,
+            )
+            data = resp.json()
         except Exception:  # noqa: BLE001 — 페이지 실패는 나머지 페이지로 계속
             continue
-        soup = BeautifulSoup(resp.text, "html.parser")
-        page_links = [
-            a for a in soup.find_all("a", href=True)
-            if "notice_detail.do" in a.get("href", "")
-        ]
-        if not page_links:
-            break  # 게시판 구조 변경 또는 마지막 페이지 도달
-        for node in page_links:
-            text = _text(node)
-            if not text:
+        content = (data.get("result") or {}).get("content") or []
+        if not content:
+            break
+        for row in content:
+            sernum = row.get("serNum")
+            title = (row.get("title") or "").strip()
+            if not sernum or not title:
                 continue
-            # 링크 텍스트 = '제목 날짜' — 끝의 날짜 분리
-            date_m = re.search(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
-            title = text[: date_m.start()].strip() if date_m else text.strip()
-            if not title or not any(k in title for k in NOTICE_KEYWORDS):
-                continue
-            url = _abs(NOTICE_LIST, node.get("href"))
-            if not url:
-                continue
+            raw_content = row.get("content") or ""
+            preview = html_unescape(HTML_TAG.sub(" ", raw_content))
+            preview = re.sub(r"\s+", " ", preview).strip()[:500]
             published = None
-            if date_m:
+            rgst_dt = row.get("rgstDt") or ""
+            if re.fullmatch(r"\d{8}", rgst_dt):
                 try:
                     published = datetime(
-                        int(date_m.group(1)), int(date_m.group(2)),
-                        int(date_m.group(3)), tzinfo=KST,
+                        int(rgst_dt[:4]), int(rgst_dt[4:6]), int(rgst_dt[6:8]), tzinfo=KST,
                     )
                 except ValueError:
                     published = None
-            notices.append(ScrapedNotice(title=title, url=url, published_at=published))
+            notices.append(ScrapedNotice(
+                title=title,
+                url=NOTICE_DETAIL.format(sernum=sernum),
+                content_preview=preview or None,
+                published_at=published,
+            ))
     unique: dict[str, ScrapedNotice] = {}
     for n in notices:
         unique.setdefault(n.url, n)

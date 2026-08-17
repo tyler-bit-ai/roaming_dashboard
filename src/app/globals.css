@@ -659,6 +659,67 @@ select {
   content: '▾ ';
 }
 
+/* 경쟁사 동향 피드 — 이벤트 타입 태그 (신규/변경/단종/공지) */
+.feed-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+
+.feed-tag--new {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.feed-tag--change {
+  background: rgba(217, 119, 6, 0.12);
+  color: var(--warning);
+}
+
+.feed-tag--gone {
+  background: var(--surface-muted);
+  color: var(--text-tertiary);
+  border: 1px solid var(--surface-border);
+}
+
+.feed-tag--notice {
+  background: rgba(13, 148, 136, 0.12);
+  color: var(--teal);
+}
+
+/* 요금제 비교 매트릭스 — 당사(SKT) 행 강조 */
+.compare-row--self {
+  background: rgba(220, 38, 38, 0.05);
+}
+
+.compare-row--self td:first-child {
+  box-shadow: inset 3px 0 0 var(--color-skt);
+}
+
+.compare-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.compare-rank--top {
+  background: var(--success);
+  color: #fff;
+}
+
 /* 뉴스/공지 리스트 카드 */
 .list-card-row {
   display: flex;

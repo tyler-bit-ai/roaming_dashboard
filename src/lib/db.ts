@@ -10,6 +10,7 @@
 import postgres, { type Sql, type PendingQuery } from "postgres";
 import type {
   Carrier,
+  ChangeEvent,
   ItemVersion,
   ListFilters,
   NewsArticle,
@@ -26,18 +27,25 @@ export function hasDb(): boolean {
   return Boolean(process.env.DATABASE_URL);
 }
 
-let cached: Sql | null | undefined;
+// 주의: 모듈 최상위 let 이 아니라 반드시 globalThis 에 캐시해야 한다.
+// Next.js dev 모드의 Fast Refresh는 요청마다 서버 모듈을 재평가할 수 있어, 모듈 스코프
+// 변수는 매 요청 새 postgres.js 풀(최대 5커넥션)을 만들고 이전 풀은 닫히지 않은 채
+// 버려진다 — Supabase 커넥션 한도에 누적으로 부딪혀 응답이 점점 느려지다 멎는다.
+declare global {
+  // eslint-disable-next-line no-var
+  var __roamingSql: Sql | null | undefined;
+}
 
-/** postgres.js 클라이언트 (지연 생성) */
+/** postgres.js 클라이언트 (지연 생성, globalThis 캐시로 dev HMR 간에도 재사용) */
 export function getSql(): Sql | null {
-  if (cached === undefined) {
+  if (globalThis.__roamingSql === undefined) {
     const url = process.env.DATABASE_URL;
     if (!url) {
-      cached = null;
+      globalThis.__roamingSql = null;
     } else {
       // 로컬 postgres는 SSL 없이, 원격(Supabase/Neon)은 SSL 필수
       const isLocal = /localhost|127\.0\.0\.1/.test(url);
-      cached = postgres(url, {
+      globalThis.__roamingSql = postgres(url, {
         prepare: false, // pgbouncer(transaction 모드) 호환
         ssl: isLocal ? false : "require",
         max: 5,
@@ -46,7 +54,7 @@ export function getSql(): Sql | null {
       });
     }
   }
-  return cached;
+  return globalThis.__roamingSql;
 }
 
 function sqlOrThrow(): Sql {
@@ -142,6 +150,52 @@ export async function getNewNotices(limit = 5): Promise<Notice[]> {
     JOIN carriers c ON c.id = n.carrier_id
     WHERE n.first_seen_at > now() - interval '24 hours'
     ORDER BY n.first_seen_at DESC
+    LIMIT ${limit}
+  `;
+}
+
+/** 활성 요금제 전체(경쟁사 비교 매트릭스용) — 카테고리 'plan'만, 필터 없음 */
+export async function getActivePlans(): Promise<RoamingItem[]> {
+  return sqlOrThrow()<RoamingItem[]>`
+    SELECT i.*, c.code AS carrier_code, c.name AS carrier_name, c.color AS carrier_color,
+           0 AS version_count
+    FROM roaming_items i
+    JOIN carriers c ON c.id = i.carrier_id
+    WHERE i.is_active = true AND i.category = 'plan'
+    ORDER BY c.code, i.name
+  `;
+}
+
+/** 최근 가격/내용 변경 이벤트 (버전 2건 이상 있는 항목의 최신 vs 직전 버전 diff) */
+export async function getRecentChanges(limit = 12): Promise<ChangeEvent[]> {
+  return sqlOrThrow()<ChangeEvent[]>`
+    SELECT i.id AS item_id, i.name, v_prev.name AS old_name, i.category,
+           v_prev.price AS old_price, i.price AS new_price, v_last.captured_at AS changed_at,
+           c.code AS carrier_code, c.name AS carrier_name, c.color AS carrier_color
+    FROM roaming_items i
+    JOIN carriers c ON c.id = i.carrier_id
+    JOIN LATERAL (
+      SELECT * FROM roaming_item_versions WHERE item_id = i.id ORDER BY version_no DESC LIMIT 1
+    ) v_last ON true
+    JOIN LATERAL (
+      SELECT * FROM roaming_item_versions
+      WHERE item_id = i.id AND version_no < v_last.version_no
+      ORDER BY version_no DESC LIMIT 1
+    ) v_prev ON true
+    ORDER BY v_last.captured_at DESC
+    LIMIT ${limit}
+  `;
+}
+
+/** 최근 단종(is_active=false 전환) 항목 — 경쟁사 상품 정리 동향 파악용 */
+export async function getRecentlyDeactivated(limit = 8): Promise<RoamingItem[]> {
+  return sqlOrThrow()<RoamingItem[]>`
+    SELECT i.*, c.code AS carrier_code, c.name AS carrier_name, c.color AS carrier_color,
+           0 AS version_count
+    FROM roaming_items i
+    JOIN carriers c ON c.id = i.carrier_id
+    WHERE i.is_active = false
+    ORDER BY i.last_seen_at DESC
     LIMIT ${limit}
   `;
 }

@@ -13,8 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from collector.scrapers.kt import collect_notices as kt_notices  # noqa: E402
 from collector.scrapers.kt import collect_products as kt_products  # noqa: E402
+from collector.scrapers.lgu import collect_catalog_plans as lgu_catalog  # noqa: E402
 from collector.scrapers.lgu import collect_guide_services as lgu_guide  # noqa: E402
-from collector.scrapers.lgu import collect_hub_services as lgu_hub  # noqa: E402
+from collector.scrapers.lgu import collect_notices as lgu_notices  # noqa: E402
 from collector.scrapers.skt import collect_fee_page_products as skt_fee  # noqa: E402
 from collector.scrapers.skt import collect_notices as skt_notices  # noqa: E402
 
@@ -57,15 +58,20 @@ def main() -> None:
     if "lgu" in targets:
         print("=" * 60, "\nLG유플러스")
         try:
-            items = lgu_hub()
-            show("허브 서비스", items, ("name", "price", "url"))
+            items = lgu_catalog()
+            show("요금제(카탈로그 API)", items, ("name", "price", "url"))
         except Exception as exc:
-            print("  [허브 실패]", exc)
+            print("  [요금제 실패]", exc)
         try:
             items = lgu_guide()
             show("가이드 요금", items, ("name", "price", "url"))
         except Exception as exc:
             print("  [가이드 실패]", exc)
+        try:
+            rows = lgu_notices()
+            show("공지", rows, ("title", "url"))
+        except Exception as exc:
+            print("  [공지 실패]", exc)
 
     if "naver" in targets:
         print("=" * 60, "\n네이버 뉴스")

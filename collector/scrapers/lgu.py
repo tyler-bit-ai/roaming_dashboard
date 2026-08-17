@@ -1,16 +1,17 @@
 """LG유플러스 (lguplus.com) 스크래퍼.
 
-검증된 구조 (2026-08-17 라이브 분석):
-  - 핵심 사실: 데스크톱 UA → CSR 셸(데이터 없음), 모바일 UA → SSR 버전(데이터 포함).
-    따라서 모든 LGU+ 요청은 MOBILE_HEADERS(iPhone UA)로 보낸다.
-  - /plan/roaming (요금제 목록): 모바일 UA 로도 상품 가격은 CSR — 허브의
-    링크/설명(부가서비스·가이드·상품권)만 SSR 되어 수집 가능.
-  - /plan/roaming/guide (이용 가이드): 모바일 UA → SSR — 데이터 안심옵션/문자
-    건당 요금 등 부가서비스 요금 정보가 HTML 에 포함됨.
-  - 공지사항: 안정적인 SSR 경로 미확인 (v1 제외, scrape_runs 에 기록됨).
-
-요금제 목록의 완전한 수집은 별도 렌더링 환경(헤드리스 브라우저 또는 내부 API
-역설계)이 필요 — 후속 개선 과제. 현재는 아래 두 소스로 부가서비스/가이드 변경 추적.
+검증된 구조 (2026-08-18 재검증 — 헤드리스 브라우저로 실제 네트워크 요청 캡처):
+  - 요금제 목록(/plan/roaming/all-plans)은 화면 자체는 CSR 이지만, 화면이 호출하는
+    공개 REST API 를 직접 부르면 인증/세션 없이 완전한 데이터가 내려온다:
+      1) GET /uhdc/fo/prdv/abrm/prod/v1/rmng-catg           → 카테고리 목록(로밍패스 등 3종)
+      2) GET /uhdc/fo/prdv/abrm/prod/v1/pp-grps/pps?catgCd=X → 카테고리별 상품 그룹+상품 상세
+    (과거 코드는 이걸 몰라서 허브 페이지의 링크 텍스트를 휴리스틱으로 긁었고, 결과가
+    거의 비어 있었다 — 이제는 통신사가 직접 내려주는 가격/용량/기간 원본을 그대로 쓴다.)
+  - 이용 가이드(/plan/roaming/guide)는 모바일 UA 로 요청하면 SSR 되어 데이터 안심옵션 등
+    부가서비스 가격이 HTML 에 포함된다 (기존에 검증된 그대로 유지).
+  - 공지사항(/plan/roaming/support/notice)은 사실 데스크톱 UA 로 이미 SSR 되고 있었다
+    (과거 코드가 "안정 경로 미확인"으로 잘못 판단해 빈 리스트를 반환했었음) — 테이블을
+    파싱하면 된다. 페이지네이션은 ?pageNo=N 쿼리 파라미터.
 """
 from __future__ import annotations
 
@@ -26,13 +27,14 @@ from collector.scrapers.base import BaseCarrierScraper, ScrapedItem, ScrapedNoti
 
 KST = ZoneInfo("Asia/Seoul")
 
-PLAN_PAGE = "https://www.lguplus.com/plan/roaming"
 GUIDE_PAGE = "https://www.lguplus.com/plan/roaming/guide?currentTab=TAB1"
+CATEGORY_API = "https://www.lguplus.com/uhdc/fo/prdv/abrm/prod/v1/rmng-catg"
+PRODUCTS_API = "https://www.lguplus.com/uhdc/fo/prdv/abrm/prod/v1/pp-grps/pps"
+PLAN_DETAIL = "https://www.lguplus.com/plan/roaming/gnr/{code}"
+NOTICE_PAGE = "https://www.lguplus.com/plan/roaming/support/notice"
+NOTICE_DETAIL = "https://www.lguplus.com/plan/roaming/support/notice/{nid}"
+NOTICE_PAGES = 3  # 페이지당 10건 — 최근 30건 수집
 
-# LGU+ 검증 사실(2026-08-17): 반환 페이지가 UA 에 따라 갈린다.
-#   - 허브(PLAN_PAGE): 데스크톱 UA 페이지(322KB)에만 링크 존재, 모바일 UA 는 링크 없는 셸
-#   - 가이드(GUIDE_PAGE): 모바일 UA 에만 가격 포함 SSR 반환
-# 따라서 각 소스에 맞는 UA 를 고정해 요청한다 (랜덤 로테이션 금지).
 MOBILE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
@@ -47,6 +49,8 @@ DESKTOP_HEADERS = {
 }
 
 PRICE_PATTERN = re.compile(r"[\d,]+\s*원")
+NOTICE_DATE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+NOTICE_ID = re.compile(r"/support/notice/(\d+)")
 
 
 def _abs(base: str, href: str | None) -> str | None:
@@ -60,33 +64,64 @@ def _text(node) -> str:
     return re.sub(r"\s+", " ", node.get_text(" ", strip=True)) if node else ""
 
 
-def collect_hub_services() -> list[ScrapedItem]:
-    """로밍 허브 페이지의 링크형 콘텐츠(부가서비스/가이드/상품권)를 service 항목으로 수집."""
-    resp = fetch(PLAN_PAGE, headers=DESKTOP_HEADERS)
-    soup = BeautifulSoup(resp.text, "html.parser")
+def collect_catalog_plans() -> list[ScrapedItem]:
+    """공식 요금제 카탈로그 API — 카테고리(로밍패스/나눠쓰기/제로프리미엄) 전체 순회.
+
+    catgCd 는 카테고리 API로 동적 조회(하드코딩 시 신규 카테고리 추가에 취약).
+    상품 하나당 가격/용량(GB, KB 원본)/기간/통화조건/대상국가를 raw 에 그대로 보존한다.
+    """
+    try:
+        resp = fetch(CATEGORY_API, headers=DESKTOP_HEADERS)
+        categories = resp.json()
+    except Exception:  # noqa: BLE001 — 카테고리 조회 실패 시 전체 스킵
+        return []
+
     items: list[ScrapedItem] = []
-    for a in soup.find_all("a", href=True):
-        url = _abs(PLAN_PAGE, a["href"])
-        if not url or "lguplus.com" not in url and "uplus.co.kr" not in url:
+    for cat in categories:
+        catg_cd = cat.get("urcAbrdRmngProdCd")
+        catg_name = cat.get("urcAbrdRmngProdNm") or ""
+        if not catg_cd:
             continue
-        text = _text(a)
-        # 로밍 관련 링크만, 링크 텍스트에 설명이 포함된 카드형만 채택
-        if not text or "로밍" not in text or len(text) < 12 or len(text) > 200:
+        try:
+            resp = fetch(PRODUCTS_API, params={"catgCd": catg_cd}, headers=DESKTOP_HEADERS)
+            groups = resp.json()
+        except Exception:  # noqa: BLE001 — 카테고리 하나 실패해도 나머지는 계속
             continue
-        if any(skip in text for skip in ("이용 현황", "로그인", "MY")):
-            continue
-        # 첫 텍스트 조각을 이름으로, 나머지를 설명으로
-        parts = text.split(" ")
-        name = parts[0] if len(parts) == 1 else " ".join(parts[:4])
-        items.append(ScrapedItem(
-            name=name[:60],
-            url=url,
-            category="service",
-            raw={"text": text[:300]},
-        ))
-    unique: dict[str, ScrapedItem] = {}
+        for group in groups or []:
+            grp = group.get("ppGrp") or {}
+            grp_name = grp.get("urcAbrdRmngProdNm") or ""
+            for entry in group.get("ppList") or []:
+                prod = entry.get("prod") or {}
+                code = prod.get("urcAbrdRmngProdCd")
+                name = (prod.get("urcAbrdRmngProdNm") or "").strip()
+                if not code or not name:
+                    continue
+                data_kb_raw = prod.get("rmngProdDataOfqnCntn")
+                data_gb = None
+                try:
+                    data_gb = round(int(data_kb_raw) / 1024 / 1024, 2) if data_kb_raw else None
+                except (TypeError, ValueError):
+                    data_gb = None
+                items.append(ScrapedItem(
+                    name=name,
+                    url=PLAN_DETAIL.format(code=code),
+                    category="plan",
+                    region=prod.get("rmngProdNatnCntn"),
+                    price=prod.get("rmngTadvChrgCntn"),
+                    raw={
+                        "prodCode": code,
+                        "category": catg_name,
+                        "group": grp_name,
+                        "term": prod.get("rmngTadvTermCntn"),
+                        "voice": prod.get("rmngProdTelCntn"),
+                        "data": prod.get("rmngProdDataCntn"),
+                        "data_kb": data_kb_raw,
+                        "data_gb": data_gb,
+                    },
+                ))
+    unique: dict[tuple[str, str], ScrapedItem] = {}
     for item in items:
-        unique.setdefault(item.url, item)
+        unique.setdefault((item.url, item.name), item)
     return list(unique.values())
 
 
@@ -135,12 +170,59 @@ def _parse_guide_prices(soup: BeautifulSoup) -> list[ScrapedItem]:
 
 
 def collect_notices() -> list[ScrapedNotice]:
-    """LG유플러스 공지 — 안정적인 SSR 게시판 경로 미확인으로 v1 에서는 미수집.
+    """로밍 공지사항 게시판 (2026-08-18 재검증: 데스크톱 UA로 이미 SSR 되고 있었음).
 
-    scrape_runs 오류에 명시적으로 기록되도록 빈 리스트가 아니라
-    안내성 항목 없이 그냥 반환하면 run 결과에 '공지 0건'으로 남는다.
+    표 구조: tbody > tr[role=row] > td(유형) / td.c-cell-subject(제목+링크, 중요 플래그) /
+    td.c-cell-date(등록일 YYYY-MM-DD). 상세 링크는 /plan/roaming/support/notice/{id}.
     """
-    return []
+    notices: list[ScrapedNotice] = []
+    for page in range(1, NOTICE_PAGES + 1):
+        try:
+            resp = fetch(NOTICE_PAGE, params={"pageNo": page}, headers=DESKTOP_HEADERS)
+        except Exception:  # noqa: BLE001 — 페이지 실패는 나머지 페이지로 계속
+            continue
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select("tbody tr[role='row']")
+        if not rows:
+            break
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue
+            notice_type = _text(cells[0])
+            subject_cell = cells[1]
+            link = subject_cell.find("a", href=True)
+            if link is None:
+                continue
+            title = _text(link)
+            is_important = subject_cell.find("small", class_="c-flag") is not None
+            if is_important and not title.startswith("[중요]"):
+                title = f"[중요] {title}"
+            if notice_type and notice_type not in title:
+                title = f"[{notice_type}] {title}"
+            # href 에 ?pageNo=N 이 섞여 있어(글 목록상 위치) 그대로 쓰면 게시글이 다음
+            # 페이지로 밀릴 때마다 URL이 바뀌어 같은 글이 중복 저장된다 — id만 추출해
+            # 안정적인 URL로 정규화한다.
+            href = link.get("href") or ""
+            id_m = NOTICE_ID.search(href)
+            url = NOTICE_DETAIL.format(nid=id_m.group(1)) if id_m else _abs(NOTICE_PAGE, href)
+            if not title or not url:
+                continue
+            date_text = _text(cells[2])
+            date_m = NOTICE_DATE.search(date_text)
+            published = None
+            if date_m:
+                try:
+                    published = datetime(
+                        int(date_m.group(1)), int(date_m.group(2)), int(date_m.group(3)), tzinfo=KST,
+                    )
+                except ValueError:
+                    published = None
+            notices.append(ScrapedNotice(title=title, url=url, published_at=published))
+    unique: dict[str, ScrapedNotice] = {}
+    for n in notices:
+        unique.setdefault(n.url, n)
+    return list(unique.values())
 
 
 class LguScraper(BaseCarrierScraper):
@@ -148,7 +230,7 @@ class LguScraper(BaseCarrierScraper):
     target = "lgu"
 
     def collect_plans(self) -> list[ScrapedItem]:
-        return collect_hub_services() + collect_guide_services()
+        return collect_catalog_plans() + collect_guide_services()
 
     def collect_notices(self) -> list[ScrapedNotice]:
         return collect_notices()

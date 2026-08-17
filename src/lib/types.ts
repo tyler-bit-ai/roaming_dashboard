@@ -94,6 +94,20 @@ export interface ScrapeRun {
   error_message: string | null;
 }
 
+/** 요금제/서비스 가격·이름 변경 이벤트 (최신 버전 vs 직전 버전 diff) */
+export interface ChangeEvent {
+  item_id: number;
+  name: string;
+  old_name: string | null;
+  category: ItemCategory;
+  old_price: string | null;
+  new_price: string | null;
+  changed_at: string;
+  carrier_code: CarrierCode;
+  carrier_name: string;
+  carrier_color: string;
+}
+
 /** 오버뷰 KPI 집계 결과 */
 export interface OverviewStats {
   activeItems: number;
