@@ -54,8 +54,9 @@ class BaseCarrierScraper:
         """요금제/부가서비스/프로모션 수집 (각 통신사가 구현)."""
         raise NotImplementedError
 
-    def collect_notices(self) -> list[ScrapedNotice]:
-        """공지사항 수집 (각 통신사가 구현)."""
+    def collect_notices(self, known_urls: set[str]) -> list[ScrapedNotice]:
+        """공지사항 수집 (각 통신사가 구현). known_urls는 이미 DB에 있는 이 통신사의
+        공지 URL 집합 — 조기 페이지네이션 종료 및 신규 글 판별에 사용한다."""
         raise NotImplementedError
 
     def run(self, conn: psycopg.Connection, carrier_id: int) -> ScrapeResult:
@@ -107,7 +108,8 @@ class BaseCarrierScraper:
 
         # 3) 공지사항 수집 + 적재
         try:
-            notices = self.collect_notices()
+            known_urls = db.get_known_notice_urls(conn, carrier_id)
+            notices = self.collect_notices(known_urls)
             n_inserted = n_updated = n_unchanged = 0
             for notice in notices:
                 content_hash = db.compute_hash(notice.title, notice.content_preview)

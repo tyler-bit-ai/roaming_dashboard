@@ -28,6 +28,8 @@ interface FilterBarProps {
   showNewsKeyword?: boolean;
   /** 키워드 드롭다운 선택지 (DB의 DISTINCT query_keyword) */
   newsKeywordOptions?: string[];
+  /** 필터 변경 시에도 유지해야 하는 추가 URL 파라미터 (예: 요금제 페이지의 view=list) */
+  extraParams?: Record<string, string | undefined>;
 }
 
 const CARRIER_OPTIONS = [
@@ -50,6 +52,7 @@ export default function FilterBar({
   showCategory = false,
   showNewsKeyword = false,
   newsKeywordOptions = [],
+  extraParams = {},
 }: FilterBarProps) {
   const router = useRouter();
   const pathname = usePathname();
@@ -69,6 +72,11 @@ export default function FilterBar({
     const merged = { ...values, ...next };
     setValues(merged);
     const params = new URLSearchParams();
+    // view=list 같이 필터와 무관하게 유지해야 하는 파라미터를 먼저 채운다 —
+    // 그렇지 않으면 필터 조작 시 URL에서 이 값이 사라져 기본 뷰로 튕긴다.
+    for (const [key, value] of Object.entries(extraParams)) {
+      if (value) params.set(key, value);
+    }
     if (merged.carrier && merged.carrier !== "ALL") params.set("carrier", merged.carrier);
     if (merged.category && merged.category !== "ALL") params.set("category", merged.category);
     if (merged.keyword.trim()) params.set("q", merged.keyword.trim());
@@ -93,8 +101,13 @@ export default function FilterBar({
       dateTo: "",
       newsKeyword: "ALL",
     });
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(extraParams)) {
+      if (value) params.set(key, value);
+    }
+    const qs = params.toString();
     startTransition(() => {
-      router.push(pathname);
+      router.push(qs ? `${pathname}?${qs}` : pathname);
     });
   };
 

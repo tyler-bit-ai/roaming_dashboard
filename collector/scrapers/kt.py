@@ -24,6 +24,8 @@ KST = ZoneInfo("Asia/Seoul")
 HOME = "https://globalroaming.kt.com/"
 DATA_PRODUCTS = "https://globalroaming.kt.com/product/data/main"
 NEWS_BOARD = "https://globalroaming.kt.com/news/list"
+MAX_NOTICE_PAGES = 15  # 안전 상한 — 게시판 전체는 라이브 검증 시 14페이지(2026-08-19)
+PREVIEW_FETCH_LIMIT = 20  # 신규 글 상세 미리보기는 최대 이 건수까지만(최초 백필 폭주 방지)
 
 PRICE_PATTERN = re.compile(r"[\d,]+\s*원")
 DATA_PATTERN = re.compile(r"(\d+(?:\.\d+)?\s*GB(?:\s*\+\s*\d+\s*분)?|무제한)", re.I)
@@ -155,32 +157,64 @@ def _parse_date(row_text: str, default_year: int) -> datetime | None:
             return None
     return None
 
-def collect_notices() -> list[ScrapedNotice]:
-    """KT 로밍 공지 — /news/list 전체 게시판 + 홈 최신 공지 섹션."""
+def _extract_notice_preview(url: str) -> str | None:
+    """공지 상세 페이지(div.cont article)에서 본문 앞부분을 추출."""
+    try:
+        resp = http_fetch(url)
+    except Exception:  # noqa: BLE001 — 상세 조회 실패해도 목록 자체는 유효
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    body = soup.select_one("div.cont article") or soup.select_one("div.cont")
+    if body is None:
+        return None
+    text = _text(body)[:300]
+    return text or None
+
+
+def collect_notices(known_urls: set[str]) -> list[ScrapedNotice]:
+    """KT 로밍 공지 — /news/list 전체 게시판(페이지네이션) + 홈 최신 공지 섹션.
+
+    게시판은 상단 고정 "공지"(class=notice) 행 몇 건 + 등록일 내림차순 일반 행으로
+    구성된다(2026-08-19 라이브 검증, 총 14페이지/136건). 고정 행은 날짜 순서를
+    따르지 않으므로 조기 종료 판단에서 제외하고, 일반 행 중 이미 DB에 있는 글을
+    만나면 그 이후 페이지는 전부 기존 글이라 조회를 멈춘다.
+    신규 글(known_urls에 없는 글)만 상세 페이지를 추가로 열어 본문 미리보기를 채운다 —
+    매일 136건 전부를 상세 조회하면 실행시간이 감당할 수 없이 커지기 때문이다.
+    """
     notices: list[ScrapedNotice] = []
     year_now = datetime.now(KST).year
 
-    # 1) 전체 게시판 (SSR 확인됨)
-    try:
-        resp = http_fetch(NEWS_BOARD)
+    # 1) 전체 게시판 (SSR 확인됨) — 신규 글이 나올 때까지 페이지 순회
+    for page in range(1, MAX_NOTICE_PAGES + 1):
+        try:
+            resp = http_fetch(NEWS_BOARD, params={"gp": page, "sp": 1, "type": "", "val": ""})
+        except Exception:  # noqa: BLE001 — 페이지 실패는 나머지 페이지로 계속
+            continue
         soup = BeautifulSoup(resp.text, "html.parser")
-        for node in soup.select("a[href*='/news/view']"):
-            title = _text(node)
+        rows = soup.select("table tbody tr")
+        if not rows:
+            break
+        hit_known_regular = False
+        for row in rows:
+            link = row.select_one("a[href*='/news/view']")
+            if link is None:
+                continue
+            title = _text(link)
             if not title or len(title) < 6:
                 continue
-            url = _abs(NEWS_BOARD, node.get("href"))
+            url = _abs(NEWS_BOARD, link.get("href"))
             if not url:
                 continue
-            row = node.find_parent(["tr", "li", "div"]) or node
-            notices.append(ScrapedNotice(
-                title=title,
-                url=url,
-                published_at=_parse_date(_text(row), year_now),
-            ))
-    except Exception:  # noqa: BLE001
-        pass
+            cells = row.find_all("td")
+            published = _parse_date(_text(cells[-2]), year_now) if len(cells) >= 2 else None
+            is_pinned = "notice" in (row.get("class") or [])
+            notices.append(ScrapedNotice(title=title, url=url, published_at=published))
+            if not is_pinned and url in known_urls:
+                hit_known_regular = True
+        if hit_known_regular:
+            break
 
-    # 2) 홈 최신 공지 (ul#notice: em=날짜, span=제목)
+    # 2) 홈 최신 공지 (ul#notice: em=날짜, span=제목) — 게시판에 없는 경우 대비 보조 소스
     try:
         resp = http_fetch(HOME)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -203,7 +237,16 @@ def collect_notices() -> list[ScrapedNotice]:
     unique: dict[str, ScrapedNotice] = {}
     for n in notices:
         unique.setdefault(n.url, n)
-    return list(unique.values())
+    result = list(unique.values())
+
+    # 3) 신규 글만 상세 페이지에서 본문 미리보기 추출 (건수 상한으로 폭주 방지 —
+    #    신규 배포 직후 첫 백필처럼 신규 글이 대량으로 잡히는 경우를 대비)
+    new_count = 0
+    for n in result:
+        if n.url not in known_urls and new_count < PREVIEW_FETCH_LIMIT:
+            n.content_preview = _extract_notice_preview(n.url)
+            new_count += 1
+    return result
 
 class KtScraper(BaseCarrierScraper):
     code = "KT"
@@ -212,5 +255,5 @@ class KtScraper(BaseCarrierScraper):
     def collect_plans(self) -> list[ScrapedItem]:
         return collect_products()
 
-    def collect_notices(self) -> list[ScrapedNotice]:
-        return collect_notices()
+    def collect_notices(self, known_urls: set[str]) -> list[ScrapedNotice]:
+        return collect_notices(known_urls)

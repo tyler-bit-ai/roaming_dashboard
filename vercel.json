@@ -5,5 +5,9 @@
       "path": "/api/cron/collect_all",
       "schedule": "0 0 * * *"
     }
-  ]
+  ],
+  "functions": {
+    "api/cron/collect_all.py": { "maxDuration": 60 },
+    "api/manual/collect.py": { "maxDuration": 60 }
+  }
 }

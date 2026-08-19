@@ -36,7 +36,7 @@ M_FEE_PAGE = "https://m.tworld.co.kr/product/roaming/fee"
 NOTICE_PAGE_URL = "https://www.tworld.co.kr/web/support/notice/roaming"
 NOTICE_API = "https://www.tworld.co.kr/core-modification/v1/notice-roaming"
 NOTICE_DETAIL = "https://www.tworld.co.kr/web/support/notice/roaming/detail/{sernum}"
-NOTICE_PAGES = 5          # 페이지당 10건 — 최근 50건 수집
+MAX_NOTICE_PAGES = 20     # 페이지당 10건 — 안전 상한(신규 배포 첫 실행 시 백필용)
 
 PRICE_PATTERN = re.compile(r"[\d,]+\s*원")
 DATA_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(GB|MB|무제한)", re.I)
@@ -110,16 +110,20 @@ def collect_fee_page_products() -> list[ScrapedItem]:
     return list(unique.values())
 
 
-def collect_notices() -> list[ScrapedNotice]:
+def collect_notices(known_urls: set[str]) -> list[ScrapedNotice]:
     """T로밍 전용 공지사항 (2026-08-18 검증).
 
     페이지(/web/support/notice/roaming) 자체는 BFF 기반 CSR 이지만, 실제 목록은
     공개 REST 엔드포인트에서 내려온다. Referer 헤더만 채워주면 인증/쿠키 없이 200.
     이 게시판은 T로밍 전용이라 전체가 로밍 관련 — 키워드 필터가 필요 없다.
+
+    등록일(rgstDt) 내림차순으로 정렬되어 있어(핀 고정 없음), 이미 DB에 있는 글을
+    만나면 그 이후 페이지는 전부 기존 글이므로 조회를 멈춘다 — 매일 5페이지를
+    통째로 다시 긁지 않고 신규 글만 확인하게 되어 실행시간이 크게 줄어든다.
     """
     notices: list[ScrapedNotice] = []
     headers = {"Accept": "application/json", "Referer": NOTICE_PAGE_URL}
-    for page in range(NOTICE_PAGES):
+    for page in range(MAX_NOTICE_PAGES):
         try:
             resp = http.fetch(
                 NOTICE_API,
@@ -132,6 +136,7 @@ def collect_notices() -> list[ScrapedNotice]:
         content = (data.get("result") or {}).get("content") or []
         if not content:
             break
+        hit_known = False
         for row in content:
             sernum = row.get("serNum")
             title = (row.get("title") or "").strip()
@@ -149,12 +154,17 @@ def collect_notices() -> list[ScrapedNotice]:
                     )
                 except ValueError:
                     published = None
+            url = NOTICE_DETAIL.format(sernum=sernum)
             notices.append(ScrapedNotice(
                 title=title,
-                url=NOTICE_DETAIL.format(sernum=sernum),
+                url=url,
                 content_preview=preview or None,
                 published_at=published,
             ))
+            if url in known_urls:
+                hit_known = True
+        if hit_known:
+            break
     unique: dict[str, ScrapedNotice] = {}
     for n in notices:
         unique.setdefault(n.url, n)
@@ -171,5 +181,5 @@ class SktScraper(BaseCarrierScraper):
         # benefit 필드의 '프로모션' 키워드로 category=promotion 이 잡힌다.
         return collect_fee_page_products()
 
-    def collect_notices(self) -> list[ScrapedNotice]:
-        return collect_notices()
+    def collect_notices(self, known_urls: set[str]) -> list[ScrapedNotice]:
+        return collect_notices(known_urls)

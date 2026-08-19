@@ -63,13 +63,28 @@ function sqlOrThrow(): Sql {
   return s;
 }
 
-/** 시간 문자열 → "YYYY-MM-DD HH:mm" 표시 형식 */
+const KST_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "Asia/Seoul",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+/** 시간 문자열 → KST 기준 "YYYY-MM-DD HH:mm" 표시 형식
+ *
+ * Vercel 서버리스 런타임의 프로세스 타임존은 UTC라서, Date의 getHours() 등
+ * 로컬 getter를 쓰면 KST가 아닌 UTC 시각이 그대로 표시된다(9시간 밀림).
+ * Intl.DateTimeFormat에 timeZone을 명시해 항상 KST로 렌더링한다.
+ */
 export function formatDateTime(value: string | null | undefined): string {
   if (!value) return "-";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "-";
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  // "YYYY-MM-DD HH:mm:ss" (sv-SE 로케일 형식) → 공백 기준으로 초 자르기
+  return KST_FORMATTER.format(d).slice(0, 16);
 }
 
 /** KST 기준날짜 문자열(YYYY-MM-DD)을 timestamptz 경계 리터럴로 변환 */
@@ -276,7 +291,7 @@ export async function listNotices(
       FROM notices n
       JOIN carriers c ON c.id = n.carrier_id
       WHERE ${where}
-      ORDER BY n.first_seen_at DESC, n.id DESC
+      ORDER BY coalesce(n.published_at, n.first_seen_at) DESC, n.id DESC
       LIMIT ${PAGE_SIZE} OFFSET ${offset}
     `,
     sql<{ total: number }[]>`

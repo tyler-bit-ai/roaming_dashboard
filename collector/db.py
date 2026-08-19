@@ -147,6 +147,14 @@ def deactivate_missing_items(
         return cur.rowcount
 
 
+def get_known_notice_urls(conn: psycopg.Connection, carrier_id: int) -> set[str]:
+    """해당 통신사의 기존 공지 URL 집합 — 스크래퍼가 이미 수집한 글에 도달하면
+    페이지네이션을 조기 종료하고, 신규 글에만 상세 미리보기를 추가로 가져오게 한다."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT url FROM notices WHERE carrier_id = %s", (carrier_id,))
+        return {row[0] for row in cur.fetchall()}
+
+
 def upsert_notice(
     conn: psycopg.Connection,
     *,

@@ -213,7 +213,12 @@ async function ListPlansView({ searchParams }: { searchParams: Record<string, st
 
   return (
     <>
-      <FilterBar initial={{ carrier, category, keyword: q, dateFrom: from, dateTo: to }} showCarrier showCategory />
+      <FilterBar
+        initial={{ carrier, category, keyword: q, dateFrom: from, dateTo: to }}
+        showCarrier
+        showCategory
+        extraParams={{ view: "list" }}
+      />
 
       {result.rows.length === 0 ? (
         <EmptyState message="조건에 맞는 상품이 없습니다. 필터를 변경하거나 /api/manual/collect 로 수집을 실행해주세요." />

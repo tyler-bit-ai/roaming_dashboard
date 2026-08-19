@@ -33,7 +33,8 @@ PRODUCTS_API = "https://www.lguplus.com/uhdc/fo/prdv/abrm/prod/v1/pp-grps/pps"
 PLAN_DETAIL = "https://www.lguplus.com/plan/roaming/gnr/{code}"
 NOTICE_PAGE = "https://www.lguplus.com/plan/roaming/support/notice"
 NOTICE_DETAIL = "https://www.lguplus.com/plan/roaming/support/notice/{nid}"
-NOTICE_PAGES = 3  # 페이지당 10건 — 최근 30건 수집
+MAX_NOTICE_PAGES = 15  # 안전 상한 — 게시판 전체는 라이브 검증 시 11~12페이지(2026-08-19)
+PREVIEW_FETCH_LIMIT = 20  # 신규 글 상세 미리보기는 최대 이 건수까지만(최초 백필 폭주 방지)
 
 MOBILE_HEADERS = {
     "User-Agent": (
@@ -169,14 +170,33 @@ def _parse_guide_prices(soup: BeautifulSoup) -> list[ScrapedItem]:
     return items
 
 
-def collect_notices() -> list[ScrapedNotice]:
+def _extract_notice_preview(url: str) -> str | None:
+    """공지 상세 페이지(div.body-content)에서 본문 앞부분을 추출."""
+    try:
+        resp = fetch(url, headers=DESKTOP_HEADERS)
+    except Exception:  # noqa: BLE001 — 상세 조회 실패해도 목록 자체는 유효
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    body = soup.select_one("div.body-content")
+    if body is None:
+        return None
+    text = _text(body)[:300]
+    return text or None
+
+
+def collect_notices(known_urls: set[str]) -> list[ScrapedNotice]:
     """로밍 공지사항 게시판 (2026-08-18 재검증: 데스크톱 UA로 이미 SSR 되고 있었음).
 
     표 구조: tbody > tr[role=row] > td(유형) / td.c-cell-subject(제목+링크, 중요 플래그) /
     td.c-cell-date(등록일 YYYY-MM-DD). 상세 링크는 /plan/roaming/support/notice/{id}.
+
+    "중요"(c-flag) 표시 행은 상단에 고정되어 등록일 순서를 따르지 않으므로 조기 종료
+    판단에서 제외한다. 일반 행 중 이미 DB에 있는 글을 만나면 그 이후 페이지는 전부
+    기존 글이라 조회를 멈춘다. 신규 글만 상세 페이지에서 본문 미리보기를 추가로 가져온다
+    (게시판 전체가 100건 이상이라 매일 전부 상세 조회하면 실행시간이 너무 커진다).
     """
     notices: list[ScrapedNotice] = []
-    for page in range(1, NOTICE_PAGES + 1):
+    for page in range(1, MAX_NOTICE_PAGES + 1):
         try:
             resp = fetch(NOTICE_PAGE, params={"pageNo": page}, headers=DESKTOP_HEADERS)
         except Exception:  # noqa: BLE001 — 페이지 실패는 나머지 페이지로 계속
@@ -185,6 +205,7 @@ def collect_notices() -> list[ScrapedNotice]:
         rows = soup.select("tbody tr[role='row']")
         if not rows:
             break
+        hit_known_regular = False
         for row in rows:
             cells = row.find_all("td")
             if len(cells) < 3:
@@ -219,10 +240,20 @@ def collect_notices() -> list[ScrapedNotice]:
                 except ValueError:
                     published = None
             notices.append(ScrapedNotice(title=title, url=url, published_at=published))
+            if not is_important and url in known_urls:
+                hit_known_regular = True
+        if hit_known_regular:
+            break
     unique: dict[str, ScrapedNotice] = {}
     for n in notices:
         unique.setdefault(n.url, n)
-    return list(unique.values())
+    result = list(unique.values())
+    new_count = 0
+    for n in result:
+        if n.url not in known_urls and new_count < PREVIEW_FETCH_LIMIT:
+            n.content_preview = _extract_notice_preview(n.url)
+            new_count += 1
+    return result
 
 
 class LguScraper(BaseCarrierScraper):
@@ -232,5 +263,5 @@ class LguScraper(BaseCarrierScraper):
     def collect_plans(self) -> list[ScrapedItem]:
         return collect_catalog_plans() + collect_guide_services()
 
-    def collect_notices(self) -> list[ScrapedNotice]:
-        return collect_notices()
+    def collect_notices(self, known_urls: set[str]) -> list[ScrapedNotice]:
+        return collect_notices(known_urls)
